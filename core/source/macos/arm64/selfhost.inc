@@ -84,3 +84,52 @@ macro ccall? proc*,args&
 	end match
 	bl	proc
 end macro
+
+; ccallv?: calls a *variadic* function (printf and friends) - fmt is the
+; one named parameter (passed in x0, same as ccall), everything after it is
+; a variadic argument.
+;
+; Darwin's arm64 ABI diverges from the standard AAPCS64 specifically here:
+; variadic arguments are NOT passed in x1-x7/d0-d7 the way ccall's fixed
+; arguments are - every one of them goes on the stack instead, each given a
+; flat 8-byte slot regardless of its actual width (confirmed directly:
+; `clang -S` on a variadic call with mixed int32_t/float/int64_t arguments
+; stores every single one via a 64-bit `str` at consecutive 8-byte-aligned
+; offsets - not densely packed the way i386's cdecl is). Each variadic
+; argument here must already be loaded into whichever register (general or
+; SIMD/FP) holds its value - ccallv only moves it from there onto the
+; stack, it doesn't itself evaluate labels/immediates the way ccall does.
+macro ccallv? proc*,fmt*,args&
+	if sizeof (fmt)
+		adr	x0,fmt
+	else if ~ fmt eq x0
+		mov	x0,fmt
+	end if
+
+	local count, bytes
+	count = 0
+	match any, args
+		iterate arg, args
+			count = count + 1
+		end iterate
+	end match
+
+	if count
+		bytes = count*8
+		bytes = (bytes+15) and (not 15)	; keep sp 16-byte aligned
+		sub	sp,sp,bytes
+		count = 0
+		match any, args
+			iterate arg, args
+				str	arg,[sp,count*8]
+				count = count+1
+			end iterate
+		end match
+	end if
+
+	bl	proc
+
+	if count
+		add	sp,sp,bytes
+	end if
+end macro

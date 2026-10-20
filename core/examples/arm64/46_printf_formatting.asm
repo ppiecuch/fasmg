@@ -1,18 +1,17 @@
-; Calling libSystem's printf with just a fixed string (no %-specifiers).
+; Calling libSystem's printf with `ccall` and just a fixed string (no
+; %-specifiers) - this is the one case `ccall` (the plain, fixed-argument
+; AAPCS64 helper) can correctly make on a variadic function like printf,
+; because there are no variadic arguments involved at all.
 ;
-; Note on what *doesn't* work here: passing extra arguments for format
-; specifiers (e.g. printf("%lld", x1)) the way `ccall` passes normal
-; arguments - in x1/x2/... - produces garbage. Confirmed directly: an
-; earlier version of this example did exactly that and printed wrong
-; numbers, verified by disassembly that the *registers* held the right
-; values right up to the `bl`. The actual cause: Apple's arm64 ABI diverges
-; from the standard AAPCS64 for variadic calls - only the named parameter
-; (the format string) uses the normal register convention; every variadic
-; argument after it must be pushed onto the stack instead, packed with no
-; padding, the way i386's calling convention works. `ccall`/`check`/`pass`
-; here only implement the standard fixed-argument convention, so calling a
-; variadic function with extra arguments needs a dedicated stack-argument
-; helper that doesn't exist yet - out of scope for this example suite.
+; For printf calls that *do* pass extra arguments for format specifiers,
+; see 47_printf_variadic.asm / 48_printf_variadic_mixed.asm and `ccallv` in
+; selfhost.inc. Passing those extra arguments the way `ccall` passes normal
+; arguments - in x1/x2/... - produces garbage: Apple's arm64 ABI diverges
+; from the standard AAPCS64 for variadic calls, and every variadic argument
+; must be pushed onto the stack instead (confirmed directly - an earlier
+; version of this example did exactly that, and printed wrong numbers even
+; though disassembly showed the *registers* held the right values right up
+; to the `bl`).
 
 include 'common.inc'
 
