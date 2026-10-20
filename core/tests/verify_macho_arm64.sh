@@ -35,6 +35,15 @@
 # binary used to assemble fine, pass codesign, and then SIGSEGV on a null
 # function pointer the moment it tried to call an imported function.
 #
+# Also builds core/examples/arm64/52_linked_list_pointers.asm (a real
+# pointer-based linked list using `internal_ptr`, not the array-index
+# workaround 39_linked_list.asm needed) and runs it repeatedly, without
+# lldb, to catch the "no rebase fixups" gap (see PORTING.md, "Rebase
+# fixups: gap closed") - an internal pointer baked in as a plain link-time
+# address instead of a real dyld_chained_ptr_64_rebase entry only breaks
+# once ASLR actually applies a non-zero slide, which a single run (or any
+# run under lldb, which disables ASLR) can miss by coincidence.
+#
 # Requires Xcode Command Line Tools (`otool`, `codesign`) and macOS/arm64.
 
 set -eu
@@ -172,6 +181,61 @@ set -e
 
 check "exit code when run (00_hello)" "$status2" "0"
 check "stdout when run (00_hello)" "$actual_output2" "hello from native arm64 macos"
+
+echo
+echo "--- 52_linked_list_pointers.asm (internal_ptr rebase fixups) ---"
+
+# Regression test for the "no rebase fixups" gap (see PORTING.md, "Rebase
+# fixups: gap closed"): internal_ptr's dq slots hold real internal pointers,
+# not baked-in link-time addresses, so they must be chained in with real
+# dyld_chained_ptr_64_rebase entries - after the imports' own binds, in the
+# same single-page chain - or they come out as the wrong address (or crash)
+# the moment ASLR actually slides the image. codesign/otool don't decode
+# rebase entries the way they decode binds, so the real assertion here is
+# running the binary itself, repeatedly and without lldb (which disables
+# ASLR by default and would hide this class of bug): if the chain's "next"
+# strides or target offsets are wrong, a real (non-zero) ASLR slide makes
+# list_sum dereference a stale/garbage pointer and crash or return the
+# wrong sum well before 25 runs are done.
+src3="$repo_root/core/examples/arm64/52_linked_list_pointers.asm"
+bin3="$work_dir/52_linked_list_pointers"
+
+"$bootstrap_fasmg" "$src3" "$bin3" >"$work_dir/assemble3.log" 2>&1
+if [ ! -f "$bin3" ]; then
+	echo "FAIL  assembly: $src3 failed to produce an output file"
+	sed 's/^/      /' "$work_dir/assemble3.log"
+	exit 1
+fi
+
+fixups3=$(xcrun otool -chained_fixups "$bin3")
+check_contains "imports_count is 9" "$fixups3" "imports_count  = 9"
+check_contains "segment_offset is positive (not wrapped negative)" "$fixups3" "segment_offset = 0x4000"
+
+chmod +x "$bin3"
+if ! codesign -s - "$bin3" >"$work_dir/codesign3.log" 2>&1; then
+	echo "FAIL  ad-hoc codesign (52_linked_list_pointers)"
+	sed 's/^/      /' "$work_dir/codesign3.log"
+	fail_count=$((fail_count + 1))
+else
+	echo "PASS  ad-hoc codesign (52_linked_list_pointers)"
+	pass_count=$((pass_count + 1))
+fi
+
+rebase_runs=25
+rebase_failures=0
+run=1
+while [ "$run" -le "$rebase_runs" ]; do
+	set +e
+	run_output=$("$bin3" 2>&1)
+	run_status=$?
+	set -e
+	if [ "$run_status" != "0" ] || [ "$run_output" != "PASS" ]; then
+		echo "FAIL  run $run/$rebase_runs: exit=$run_status output=$run_output"
+		rebase_failures=$((rebase_failures + 1))
+	fi
+	run=$((run + 1))
+done
+check "all $rebase_runs direct (real ASLR) runs passed" "$rebase_failures" "0"
 
 echo
 echo "$pass_count passed, $fail_count failed."

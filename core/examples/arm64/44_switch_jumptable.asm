@@ -3,14 +3,16 @@
 ; (HelloSilicon Chapter 04: case.s)
 ;
 ; The table holds *relative* offsets (case_N - jump_table), not absolute
-; code addresses - this binary is position-independent (MH_PIE), and an
-; absolute address baked into static data needs a rebase fixup to stay
-; correct once ASLR slides the image, which this macho.inc doesn't
-; implement yet (see PORTING.md, "Known gap: no rebase fixups" - found via
-; exactly this mistake in an earlier version of 39_linked_list.asm). A
-; same-image relative offset is slide-invariant, so it needs no fixup: add
-; it to the table's own runtime address (from `adr`, itself PC-relative and
-; always correct) to get the real target.
+; code addresses. This binary is position-independent (MH_PIE); an absolute
+; address baked into static data needs a rebase fixup to stay correct once
+; ASLR slides the image (macho.inc can now emit those via `internal_ptr` -
+; see PORTING.md, "Rebase fixups: gap closed", and
+; 52_linked_list_pointers.asm - this found that gap via exactly this
+; mistake in an earlier version of 39_linked_list.asm). A same-image
+; relative offset needs no fixup at all though, slide or not: add it to
+; the table's own runtime address (from `adr`, itself PC-relative and
+; always correct) to get the real target - which is also exactly what a
+; real C compiler emits for a PIC jump table, fixup support or not.
 
 include 'common.inc'
 

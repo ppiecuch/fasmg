@@ -1,14 +1,14 @@
 ; A singly linked list represented as an array of {value, next_index} pairs,
 ; with -1 as the end-of-list marker, instead of raw next-node pointers.
 ;
-; Why indices instead of pointers: a pointer to another internal label
-; baked into static data as a flat 64-bit value is an *absolute* address -
-; and this binary is position-independent (MH_PIE). Nothing currently
-; rebases that value by the ASLR slide dyld actually applies at load time
-; (this macho.inc only implements *bind* fixups, for imported symbols - not
-; *rebase* fixups, for a binary's own internal pointers; see PORTING.md,
-; "Known gap: no rebase fixups"). An index is just a plain integer with no
-; such problem, and reads just as naturally for a small fixed list.
+; This predates `internal_ptr` (see PORTING.md, "Rebase fixups: gap
+; closed", and 52_linked_list_pointers.asm for the same list built with
+; real pointers): a plain `dq label` bakes in an *absolute* link-time
+; address, and this binary is position-independent (MH_PIE) - nothing
+; rebased that value by the ASLR slide dyld actually applies at load time.
+; Kept as-is since an index is a perfectly natural way to represent a small
+; fixed list regardless, and it's one less thing to get wrong in a Mach-O
+; port still finding its feet.
 
 include 'common.inc'
 

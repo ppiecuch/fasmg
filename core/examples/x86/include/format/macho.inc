@@ -819,7 +819,75 @@ if MachO.FILETYPE <> MH_OBJECT
 	namespace MachO
 		NSYMS = 0
 		LIB_NUMBER = 0
+		REBASE_COUNT = 0
 	end namespace
+
+	; internal_ptr target: reserves one pointer-sized (dq) slot that will
+	; hold the runtime address of `target` (a label elsewhere in this same
+	; image) once dyld loads the binary - the ARM64 rebase-fixups equivalent
+	; of plain `dq target`, which bakes in the link-time absolute address
+	; and is *not* safe under ASLR (there is no fixup telling dyld to slide
+	; it - see PORTING.md, "Known gap: no rebase fixups"). Only meaningful
+	; for CPU_TYPE_ARM64; only usable inside a `segment '__DATA'` (same
+	; restriction `import`'s non-lazy symbol pointers already have).
+	;
+	; Each slot's "next fixup" chain stride can't be known at the point
+	; `internal_ptr` runs - it depends on whether a *later* internal_ptr
+	; call happens at all, which hasn't happened yet. Patching it in after
+	; the fact with `load`/`store` looked like the obvious tool, but isn't:
+	; `store` taints its whole area as "variable" for the rest of that pass
+	; (see manual.txt's "store" documentation), which broke ordinary
+	; forward-referencing loads of completely unrelated labels later in the
+	; same area - confirmed directly by bisecting a repro down to "address
+	; out of range" on exactly that. Guessing from the previous pass's final
+	; count (the way fasmg's own forward-reference convergence normally
+	; works) also isn't safe here, because nothing makes fasmg re-pass again
+	; once that guess is wrong - plain variables like a hand-rolled "REBASE_
+	; COUNT_PREV" don't participate in the engine's own convergence check
+	; the way label addresses do (confirmed directly: the guess settled one
+	; pass later than the chain field that depends on it, so the final
+	; output kept the *previous* guess's value).
+	;
+	; Instead, each slot's value forward-references a per-slot `next_term`
+	; symbol that doesn't get its real value until the postponed block at
+	; the bottom of this file, once every internal_ptr call (and the true
+	; final MachO.REBASE_COUNT) for this pass is actually known - ordinary
+	; deferred-constant resolution (":="), the same trick `sym.name_offset`
+	; above already relies on for the same reason.
+	macro internal_ptr? target*
+		if MachO.CPUTYPE = CPU_TYPE_ARM64
+			MachO.REBASE_COUNT = MachO.REBASE_COUNT + 1
+			; "#" only pastes *text*, not a variable's value (see manual.txt
+			; around the "#" operator) - plain `N = MachO.REBASE_COUNT` would
+			; make every MachO.rebase#N below collide on the literal name
+			; "MachO.rebaseN". `repeat 1, N:value` is fasmg's actual
+			; text-substitution binding (the same mechanism "%" and the
+			; existing `repeat 1, s:MachO.SEGMENT_NUMBER` idiom rely on).
+			repeat 1, N:MachO.REBASE_COUNT
+				; dyld's chained-fixups page walk follows "next" in 4-byte
+				; units and treats every stop as a real 8-byte pointer slot -
+				; it requires natural 8-byte alignment, not just our own
+				; stride arithmetic needing to divide evenly. Don't trust the
+				; caller's preceding fields to have added up to a multiple
+				; of 8 (confirmed directly: an odd-sized string literal
+				; earlier in the same __DATA section left `loc` 2 bytes
+				; off, which both corrupted the computed stride and would
+				; have hit the same misalignment dyld itself rejects).
+				align 8
+				namespace MachO.rebase#N
+					; dyld_chained_ptr_64_rebase, DYLD_CHAINED_PTR_64_OFFSET
+					; format: target is this pointer's value expressed as an
+					; offset from the image's base address; next_term holds
+					; the stride (in 4-byte units) to the next fixup location
+					; in this page, pre-shifted into position, or 0 if this
+					; turns out to be the last one.
+					loc dq (target - MachO.Settings.BaseAddress) + next_term
+				end namespace
+			end repeat
+		else
+			dq target
+		end if
+	end macro
 
 	macro interpreter? path
 		MachO.command LC_LOAD_DYLINKER
@@ -947,7 +1015,15 @@ if MachO.FILETYPE <> MH_OBJECT
 				irpv sym, MachO.nlist
 					if sym.imported
 						if % = MachO.IMPORT_TOTAL
-							macroBuilder.line sym.ptr dq (% - 1) + (1 shl 63)
+							; MachO.LAST_BIND_NEXT_TERM chains into the first
+							; internal_ptr rebase slot, if there turns out to
+							; be one - forward-referenced the same way
+							; internal_ptr's own next_term is (see its
+							; comment above): not defined for real until the
+							; postponed block at the bottom of this file,
+							; once MachO.REBASE_COUNT's true final value for
+							; this pass is known.
+							macroBuilder.line sym.ptr dq (% - 1) + MachO.LAST_BIND_NEXT_TERM + (1 shl 63)
 						else
 							macroBuilder.line sym.ptr dq (% - 1) + (2 shl 51) + (1 shl 63)
 						end if
@@ -1025,7 +1101,7 @@ if MachO.FILETYPE <> MH_OBJECT
 				; real dyld_chained_starts_in_segment.
 				MachO.CHAINED_DATA_SEG = 0
 				MachO.CHAINED_DATA_VMADDR = 0
-				if MachO.NSYMS
+				if MachO.NSYMS | MachO.REBASE_COUNT
 					repeat MachO.SEGMENT_NUMBER
 						load MachO.SEGNAME from MachO:MachO.segment#%.segname
 						if MachO.SEGNAME = '__DATA'
@@ -1039,7 +1115,7 @@ if MachO.FILETYPE <> MH_OBJECT
 				namespace MachO.chained_fixups_header
 					fixups_version dd 0
 					starts_offset  dd 28
-				  if MachO.NSYMS & MachO.CHAINED_DATA_SEG
+				  if (MachO.NSYMS | MachO.REBASE_COUNT) & MachO.CHAINED_DATA_SEG
 					imports_offset dd 28 + 4 + MachO.SEGMENT_NUMBER*4 + 24
 					symbols_offset dd 28 + 4 + MachO.SEGMENT_NUMBER*4 + 24 + MachO.NSYMS*4
 				  else
@@ -1060,10 +1136,12 @@ if MachO.FILETYPE <> MH_OBJECT
 						dd 0
 					  end if
 					end repeat
-				  if MachO.NSYMS & MachO.CHAINED_DATA_SEG
-					; dyld_chained_starts_in_segment, one 16KB page, every
-					; __nl_symbol_ptr bind starts right at page offset 0
-					; (it's always the first section placed in __DATA).
+				  if (MachO.NSYMS | MachO.REBASE_COUNT) & MachO.CHAINED_DATA_SEG
+					; dyld_chained_starts_in_segment, one 16KB page. If there
+					; are any binds, __nl_symbol_ptr is always the first
+					; section placed in __DATA, so the chain starts at page
+					; offset 0; with no binds at all, it starts wherever the
+					; first internal_ptr rebase slot landed instead.
 					size             dd 24
 					page_size        dw 0x4000
 					pointer_format   dw 6				; DYLD_CHAINED_PTR_64_OFFSET
@@ -1077,7 +1155,11 @@ if MachO.FILETYPE <> MH_OBJECT
 					segment_offset   dq MachO.CHAINED_DATA_VMADDR - MachO.Settings.BaseAddress
 					max_valid_pointer dd 0
 					page_count       dw 1
+				  if MachO.NSYMS
 					page_start       dw 0
+				  else
+					page_start       dw MachO.rebase1.loc - MachO.CHAINED_DATA_VMADDR
+				  end if
 				  end if
 				end namespace
 
@@ -1106,6 +1188,39 @@ if MachO.FILETYPE <> MH_OBJECT
 					end if
 				end irpv
 			  end if
+
+				; Resolve every next_term this pass's internal_ptr calls (and
+				; MachO.__nl_symbol_ptr's last bind, above) forward-
+				; referenced, now that MachO.REBASE_COUNT has reached its
+				; true final value for this pass. Plain ":=" assignment, not
+				; load/store - it's not writing into already-generated
+				; bytes, just resolving ordinary deferred constants, so none
+				; of the "store taints its area" restrictions apply.
+				if MachO.NSYMS & MachO.REBASE_COUNT
+					irpv sym, MachO.nlist
+						if sym.imported
+							if % = MachO.IMPORT_TOTAL
+								MachO.LAST_BIND_NEXT_TERM := ((MachO.rebase1.loc - sym.ptr) / 4) shl 51
+							end if
+						end if
+					end irpv
+				else
+					MachO.LAST_BIND_NEXT_TERM := 0
+				end if
+
+				repeat MachO.REBASE_COUNT
+					; THIS/NEXTI are bound together in one `repeat 1,`
+					; precisely so both see the *same* outer % (nesting a
+					; second `repeat` here would otherwise shadow % with the
+					; inner loop's own counter, always 1).
+					repeat 1, THIS:%, NEXTI:% + 1
+						if THIS < MachO.REBASE_COUNT
+							MachO.rebase#THIS.next_term := ((MachO.rebase#NEXTI.loc - MachO.rebase#THIS.loc) / 4) shl 51
+						else
+							MachO.rebase#THIS.next_term := 0
+						end if
+					end repeat
+				end repeat
 
 				MachO.CHAINED_FIXUPS_SIZE := $% - MachO.CHAINED_FIXUPS_OFF
 
