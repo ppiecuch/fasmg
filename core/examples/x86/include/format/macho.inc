@@ -20,10 +20,13 @@ CPU_TYPE_RS6000 	= 17
 CPU_TYPE_MC98000	= 18
 CPU_TYPE_POWERPC	= 18
 CPU_TYPE_POWERPC64	= CPU_TYPE_POWERPC or CPU_ARCH_ABI64
+CPU_TYPE_ARM64		= CPU_TYPE_ARM or CPU_ARCH_ABI64
 CPU_TYPE_VEO		= 255
 
 CPU_SUBTYPE_MASK	= 0xff000000
 CPU_SUBTYPE_LIB64	= 0x80000000
+
+CPU_SUBTYPE_ARM64_ALL	= 0
 
 CPU_SUBTYPE_I386_ALL	= 3
 CPU_SUBTYPE_X86_64_ALL	= CPU_SUBTYPE_I386_ALL
@@ -112,6 +115,16 @@ LC_LAZY_LOAD_DYLIB    = 0x20
 LC_ENCRYPTION_INFO    = 0x21
 LC_DYLD_INFO	      = 0x22
 LC_DYLD_INFO_ONLY     = 0x22 + LC_REQ_DYLD
+LC_DYLD_EXPORTS_TRIE  = 0x33 + LC_REQ_DYLD
+LC_DYLD_CHAINED_FIXUPS = 0x34 + LC_REQ_DYLD
+LC_FUNCTION_STARTS    = 0x26
+LC_DATA_IN_CODE	      = 0x29
+LC_SOURCE_VERSION     = 0x2A
+LC_MAIN 	      = 0x28 + LC_REQ_DYLD
+LC_BUILD_VERSION      = 0x32
+
+PLATFORM_MACOS	      = 1
+TOOL_LD		      = 3
 
 SG_HIGHVM  = 0x1
 SG_FVMLIB  = 0x2
@@ -235,6 +248,8 @@ namespace MachO
 
 	if defined Settings.ProcessorSubtype
 		CPUSUBTYPE := Settings.ProcessorSubtype
+	else if CPUTYPE = CPU_TYPE_ARM64
+		CPUSUBTYPE := CPU_SUBTYPE_ARM64_ALL
 	else
 		if CPUTYPE and CPU_ARCH_ABI64
 			CPUSUBTYPE := CPU_SUBTYPE_I386_ALL + CPU_SUBTYPE_LIB64
@@ -252,7 +267,17 @@ namespace MachO
 	if defined Settings.Flags
 		FLAGS := Settings.Flags
 	else if FILETYPE <> MH_OBJECT
-		FLAGS := MH_NOUNDEFS + MH_DYLDLINK
+		if CPUTYPE = CPU_TYPE_ARM64
+			; real linkers always set these for arm64 main executables;
+			; confirmed (by reordering/clearing other fields on a known-
+			; working `ld`-linked binary one at a time) that everything
+			; else about a minimal arm64 Mach-O can match ours exactly and
+			; still run - MH_TWOLEVEL/MH_PIE were the two header flags
+			; still missing at that point. See PORTING.md.
+			FLAGS := MH_NOUNDEFS + MH_DYLDLINK + MH_TWOLEVEL + MH_PIE
+		else
+			FLAGS := MH_NOUNDEFS + MH_DYLDLINK
+		end if
 	else
 		FLAGS := 0
 	end if
@@ -690,6 +715,42 @@ macro section? args&
 end macro
 
 macro entry? regs&
+	if MachO.CPUTYPE = CPU_TYPE_ARM64
+		iterate reg, regs
+			MachO.entry.target? := reg
+		end iterate
+		MachO.command LC_MAIN
+		MachO.entry.entryoff? dq (MachO.entry.target? - MachO.VM_ADDRESS)
+		MachO.entry.stacksize? dq 0
+		; the kernel's code-signing/platform policy rejects arm64 executables
+		; that don't declare a platform - without this, a freshly built,
+		; validly ad-hoc-signed binary is still killed before it ever runs.
+		MachO.command LC_BUILD_VERSION
+		MachO.entry.platform? dd PLATFORM_MACOS
+		MachO.entry.minos? dd 0x0B0000		; 11.0.0
+		MachO.entry.sdk? dd 0x0B0000		; 11.0.0
+		MachO.entry.ntools? dd 1
+		MachO.entry.tool? dd TOOL_LD
+		MachO.entry.toolversion? dd 0
+		MachO.command LC_UUID
+		MachO.entry.uuid? db 0x3a,0xa1,0x4d,0x5b,0xcf,0x4e,0x4a,0x7e,0x9d,0x0a,0x1b,0x2c,0x3d,0x4e,0x5f,0x60
+		; every real linker-produced Mach-O carries these, even a trivial one
+		; with nothing to say in them (zero offsets/sizes everywhere) - a
+		; binary missing all of them doesn't look like normal linker output.
+		MachO.command LC_SOURCE_VERSION
+		MachO.entry.srcversion? dq 0
+		MachO.command LC_FUNCTION_STARTS
+		MachO.entry.fstarts_off? dd 0
+		MachO.entry.fstarts_size? dd 0
+		MachO.command LC_DATA_IN_CODE
+		MachO.entry.dic_off? dd 0
+		MachO.entry.dic_size? dd 0
+		; LC_DYLD_CHAINED_FIXUPS/LC_DYLD_EXPORTS_TRIE (what `ld` emits instead
+		; of the legacy LC_DYLD_INFO_ONLY for arm64) can't be emitted here -
+		; their data has to live in __LINKEDIT, whose file offset isn't known
+		; until segments are laid out. See the ARM64 branch of the deferred
+		; postpone block below (same place LC_SYMTAB's data is generated).
+	else
 	iterate reg, regs
 		match name:value, reg
 			MachO.thread.name? := value
@@ -726,6 +787,7 @@ macro entry? regs&
 		end iterate
 	else
 		err 'CPU not supported'
+	end if
 	end if
 	MachO.text
 end macro
@@ -813,22 +875,26 @@ if MachO.FILETYPE <> MH_OBJECT
 
 	macro segment? args&
 		MachO.segment args
-		if MachO.NSYMS
+		if MachO.NSYMS | (MachO.CPUTYPE = CPU_TYPE_ARM64)
 			repeat 1, s:MachO.SEGMENT_NUMBER
 				load MachO.SEGNAME from MachO:MachO.segment#s.segname
 			end repeat
 			if ~MachO.__TEXT & MachO.SEGNAME = '__TEXT'
 				MachO.__TEXT = 1
-				MachO.__stubs
+				if MachO.NSYMS
+					MachO.__stubs
+				end if
 			else if ~MachO.__DATA & MachO.SEGNAME = '__DATA'
 				MachO.__DATA = 1
-				MachO.__nl_symbol_ptr
+				if MachO.NSYMS
+					MachO.__nl_symbol_ptr
+				end if
 			end if
 		end if
 	end macro
 
 	postpone
-	if MachO.NSYMS
+	if MachO.NSYMS | (MachO.CPUTYPE = CPU_TYPE_ARM64)
 
 		macroBuilder MachO.__stubs
 
@@ -836,7 +902,13 @@ if MachO.FILETYPE <> MH_OBJECT
 
 			irpv sym, MachO.nlist
 				if sym.imported
-					macroBuilder.line sym: jmp [sym.ptr]
+					if MachO.CPUTYPE = CPU_TYPE_ARM64
+						macroBuilder.line sym: adrp x16,sym.ptr
+						macroBuilder.line ldr x16,[x16,sym.ptr and 0xFFF]
+						macroBuilder.line br x16
+					else
+						macroBuilder.line sym: jmp [sym.ptr]
+					end if
 					if % = 1
 						macroBuilder.line MachO.JUMP_SIZE := $ - sym
 					end if
@@ -853,15 +925,45 @@ if MachO.FILETYPE <> MH_OBJECT
 				macroBuilder.line section '__nl_symbol_ptr' flags(S_NON_LAZY_SYMBOL_POINTERS) reserved1(0) align 4
 			end if
 
-			irpv sym, MachO.nlist
-				if sym.imported
-					if MachO.CPUTYPE and CPU_ARCH_ABI64
-						macroBuilder.line sym.ptr dq 0
-					else
-						macroBuilder.line sym.ptr dd 0
+			if MachO.CPUTYPE = CPU_TYPE_ARM64
+				; dyld on arm64 only honors chained-fixups binds, not the
+				; classic indirect-symbol-table mechanism used below (kept
+				; for the symbol table itself, just not for resolution) -
+				; encode each slot as a dyld_chained_ptr_64_bind
+				; (DYLD_CHAINED_PTR_64_OFFSET format): bit63=1 (bind),
+				; bits62:51=next (chain stride in 4-byte units, 0 = last
+				; entry), bits23:0=ordinal (0-based index into the imports
+				; table built below, in the same order as MachO.nlist).
+				; Assumes every MachO.nlist entry is `import`ed (true for
+				; every current use of this format) - a mix of `public`
+				; and `import` entries would need the ordinal counted
+				; separately from `%`.
+				MachO.IMPORT_TOTAL = 0
+				irpv sym, MachO.nlist
+					if sym.imported
+						MachO.IMPORT_TOTAL = MachO.IMPORT_TOTAL + 1
 					end if
-				end if
-			end irpv
+				end irpv
+				irpv sym, MachO.nlist
+					if sym.imported
+						if % = MachO.IMPORT_TOTAL
+							macroBuilder.line sym.ptr dq (% - 1) + (1 shl 63)
+						else
+							macroBuilder.line sym.ptr dq (% - 1) + (2 shl 51) + (1 shl 63)
+						end if
+					end if
+				end irpv
+			else
+				irpv sym, MachO.nlist
+					if sym.imported
+						if MachO.CPUTYPE and CPU_ARCH_ABI64
+							macroBuilder.line sym.ptr dq 0
+						else
+							macroBuilder.line sym.ptr dd 0
+						end if
+					end if
+				end irpv
+			end if
 
 		macroBuilder.end
 
@@ -873,7 +975,7 @@ if MachO.FILETYPE <> MH_OBJECT
 			segment '__DATA' readable writable
 		end if
 
-		segment '__LINKEDIT' readable
+		segment '__LINKEDIT' readable notwritable notexecutable
 
 			MachO.SYMOFF := $%
 			irpv sym, MachO.nlist
@@ -905,6 +1007,113 @@ if MachO.FILETYPE <> MH_OBJECT
 			end irpv
 			MachO.STRSIZE := $% - MachO.STROFF
 
+			; LC_DYLD_CHAINED_FIXUPS/LC_DYLD_EXPORTS_TRIE data. `ld` emits
+			; these for every arm64 main executable, and arm64 dyld turns
+			; out to *require* real bind entries here to actually resolve
+			; imported symbols - the classic indirect-symbol-table
+			; mechanism above is accepted structurally but never processed,
+			; leaving the __nl_symbol_ptr slots (MachO.__nl_symbol_ptr
+			; already encodes them as dyld_chained_ptr_64_bind values, see
+			; above) unresolved without this. When there's nothing imported
+			; (MachO.NSYMS = 0) this is still the minimal "nothing to do"
+			; blob from before: a header with zero imports and an
+			; all-zero-offsets dyld_chained_starts_in_image.
+			if MachO.CPUTYPE = CPU_TYPE_ARM64
+				; Find which segment holds the imports' __nl_symbol_ptr
+				; binds (always __DATA - see MachO.__nl_symbol_ptr above),
+				; so its dyld_chained_starts_in_image entry can point at a
+				; real dyld_chained_starts_in_segment.
+				MachO.CHAINED_DATA_SEG = 0
+				MachO.CHAINED_DATA_VMADDR = 0
+				if MachO.NSYMS
+					repeat MachO.SEGMENT_NUMBER
+						load MachO.SEGNAME from MachO:MachO.segment#%.segname
+						if MachO.SEGNAME = '__DATA'
+							MachO.CHAINED_DATA_SEG = %
+							load MachO.CHAINED_DATA_VMADDR from MachO:MachO.segment#%.vmaddr
+						end if
+					end repeat
+				end if
+
+				MachO.CHAINED_FIXUPS_OFF := $%
+				namespace MachO.chained_fixups_header
+					fixups_version dd 0
+					starts_offset  dd 28
+				  if MachO.NSYMS & MachO.CHAINED_DATA_SEG
+					imports_offset dd 28 + 4 + MachO.SEGMENT_NUMBER*4 + 24
+					symbols_offset dd 28 + 4 + MachO.SEGMENT_NUMBER*4 + 24 + MachO.NSYMS*4
+				  else
+					imports_offset dd 28 + 4 + MachO.SEGMENT_NUMBER*4
+					symbols_offset dd 28 + 4 + MachO.SEGMENT_NUMBER*4
+				  end if
+					imports_count  dd MachO.NSYMS
+					imports_format dd 1
+					symbols_format dd 0
+					seg_count dd MachO.SEGMENT_NUMBER
+					repeat MachO.SEGMENT_NUMBER
+					  if % = MachO.CHAINED_DATA_SEG
+						; points right after this whole seg_info_offset
+						; array, where the one dyld_chained_starts_in_segment
+						; struct below lives (relative to starts_offset).
+						dd 4 + MachO.SEGMENT_NUMBER*4
+					  else
+						dd 0
+					  end if
+					end repeat
+				  if MachO.NSYMS & MachO.CHAINED_DATA_SEG
+					; dyld_chained_starts_in_segment, one 16KB page, every
+					; __nl_symbol_ptr bind starts right at page offset 0
+					; (it's always the first section placed in __DATA).
+					size             dd 24
+					page_size        dw 0x4000
+					pointer_format   dw 6				; DYLD_CHAINED_PTR_64_OFFSET
+					; MachO.VM_ADDRESS is a running placement cursor that has
+					; already advanced past every segment by this point in
+					; assembly (not a fixed image base) - the mach_header's
+					; actual load address is the literal Settings.BaseAddress
+					; the format was configured with (same constant LC_MAIN's
+					; entryoff relies on, computed earlier before any segment
+					; mutated VM_ADDRESS).
+					segment_offset   dq MachO.CHAINED_DATA_VMADDR - MachO.Settings.BaseAddress
+					max_valid_pointer dd 0
+					page_count       dw 1
+					page_start       dw 0
+				  end if
+				end namespace
+
+			  if MachO.NSYMS
+				; dyld_chained_import[] (imports_format=1: 8-bit lib_ordinal,
+				; 1-bit weak_import, 23-bit name_offset). Every import here
+				; comes from the single `uses` dylib, i.e. lib_ordinal=1
+				; (ordinal 0 is reserved; dylibs are numbered in LC_LOAD_DYLIB
+				; order starting at 1) - a program with more than one `uses`
+				; would need to track which dylib each import came from.
+				; `sym.name_offset` is a forward reference, resolved below
+				; once the symbols blob is written - same multi-pass trick
+				; `n_strx dd sym.strx` above already relies on.
+				irpv sym, MachO.nlist
+					if sym.imported
+						dd 1 + (0 shl 8) + (sym.name_offset shl 9)
+					end if
+				end irpv
+
+				MachO.CHAINED_SYMBOLS_START := $%
+				db 0
+				irpv sym, MachO.nlist
+					if sym.imported
+						sym.name_offset := $% - MachO.CHAINED_SYMBOLS_START
+						db string sym.str, 0
+					end if
+				end irpv
+			  end if
+
+				MachO.CHAINED_FIXUPS_SIZE := $% - MachO.CHAINED_FIXUPS_OFF
+
+				MachO.EXPORTS_TRIE_OFF := $%
+				db 0, 0
+				MachO.EXPORTS_TRIE_SIZE := $% - MachO.EXPORTS_TRIE_OFF
+			end if
+
 		MachO.command LC_SYMTAB
 		namespace MachO.symtab_command
 			symoff	dd SYMOFF
@@ -934,6 +1143,20 @@ if MachO.FILETYPE <> MH_OBJECT
 			locreloff	dd 0
 			nlocrel 	dd 0
 		end namespace
+
+		if MachO.CPUTYPE = CPU_TYPE_ARM64
+			MachO.command LC_DYLD_CHAINED_FIXUPS
+			namespace MachO.chained_fixups_command
+				dataoff  dd CHAINED_FIXUPS_OFF
+				datasize dd CHAINED_FIXUPS_SIZE
+			end namespace
+
+			MachO.command LC_DYLD_EXPORTS_TRIE
+			namespace MachO.exports_trie_command
+				dataoff  dd EXPORTS_TRIE_OFF
+				datasize dd EXPORTS_TRIE_SIZE
+			end namespace
+		end if
 
 	end if
 	end postpone
