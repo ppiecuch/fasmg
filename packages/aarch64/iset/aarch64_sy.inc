@@ -33,6 +33,23 @@ macro sevl
     dd 0xd50320bf
 end macro
 
+; ARMv8.5 Branch Target Identification (FEAT_BTI) - supported by every Apple
+; M-series core; marks valid landing pads for indirect branches (`br`/`blr`)
+; under hardened-runtime/pointer-authentication codegen.
+macro bti a
+    match , a
+	dd 0xd503241f
+    else match =c?, a
+	dd 0xd503245f
+    else match =j?, a
+	dd 0xd503249f
+    else match =jc?, a
+	dd 0xd50324df
+    else
+	err 'invalid operand'
+    end match
+end macro
+
 macro mrs a*, b*
     aarch64.parse_operand @op0, a
     match =actlr_el1?, b
@@ -54,6 +71,16 @@ namespace aarch64.mrs
     spsel? = 0xd5384200
     s3_2_c3_c4_5? = 0xd53a34a0
     nzcv? = 0xd53b4200
+    ; FEAT_RNG hardware random number generator - an *optional* ARMv8.5
+    ; feature, confirmed NOT present on an actual M1 here (`mrs x0, rndr`
+    ; traps as an illegal instruction - UNDEFINED, not a bug in this
+    ; encoding, which matches Apple's own assembler exactly; see
+    ; core/tests/verify_encodings.sh). Reportedly present on later
+    ; generations - check PSTATE.NZCV via `mrs ..., nzcv` immediately after
+    ; a read and test the Z flag (bit 30, 0x40000000 - clear means the read
+    ; succeeded) before trusting the result either way.
+    rndr? = 0xd53b2400
+    rndrrs? = 0xd53b2420
 end namespace
 
 macro mrs a*, b*

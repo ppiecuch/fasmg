@@ -190,6 +190,10 @@ include 'aarch64_group.inc'
 include 'aarch64_done.inc'
 include 'aarch64_float.inc'
 include 'aarch64_sy.inc'
+include 'aarch64_lse.inc'
+include 'aarch64_pauth.inc'
+include 'aarch64_dotprod.inc'
+include 'aarch64_crypto2.inc'
 
 
 macro ands a*, b*, c*, d
